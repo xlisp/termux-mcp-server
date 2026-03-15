@@ -32,12 +32,86 @@ BLOCKED_COMMANDS = {
     'shutdown', 'reboot', 'halt', 'poweroff',
 }
 
+HOME = '/data/data/com.termux/files/home'
+
+# Android system commands that must go through adb shell on Android 12+
+_ADB_REQUIRED_CMDS = {
+    'screencap', 'uiautomator', 'input', 'am', 'pm', 'wm',
+    'settings', 'getprop', 'dumpsys', 'monkey', 'cmd', 'content',
+}
+
+def _ensure_path_env() -> dict:
+    """Return env dict with /system/bin in PATH."""
+    env = os.environ.copy()
+    path = env.get('PATH', '')
+    if '/system/bin' not in path:
+        env['PATH'] = f"/system/bin:{path}"
+    return env
+
+
+def _adb_connected() -> bool:
+    """Check if adb is connected to the device."""
+    try:
+        r = subprocess.run(
+            ['adb', 'devices'], capture_output=True, text=True, timeout=5,
+            env=_ensure_path_env(),
+        )
+        # Look for a device line like "localhost:5555	device"
+        for line in r.stdout.strip().split('\n')[1:]:
+            if '\tdevice' in line:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _adb_shell(cmd: str, timeout: int = 30) -> dict:
+    """Run a command via 'adb shell'. Used on Android 12+ where direct calls fail."""
+    try:
+        result = subprocess.run(
+            ['adb', 'shell', cmd],
+            capture_output=True, text=True,
+            timeout=timeout, encoding='utf-8', errors='replace',
+            env=_ensure_path_env(),
+        )
+        return {
+            'success': result.returncode == 0,
+            'returncode': result.returncode,
+            'stdout': result.stdout.strip(),
+            'stderr': result.stderr.strip(),
+        }
+    except subprocess.TimeoutExpired:
+        return {'success': False, 'error': f'Timed out after {timeout}s'}
+    except FileNotFoundError:
+        return {'success': False, 'error': 'adb not found. Run: pkg install android-tools'}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
 def _run(cmd: list[str] | str, timeout: int = 30, shell: bool = False) -> dict:
-    """Run a command and return structured result."""
+    """Run a command. Auto-routes through adb shell if needed on Android 12+."""
+    env = _ensure_path_env()
+
+    # Detect if this is an Android system command that needs adb shell
+    if shell and isinstance(cmd, str):
+        first_word = cmd.strip().split()[0] if cmd.strip() else ''
+    elif isinstance(cmd, list) and cmd:
+        first_word = os.path.basename(cmd[0])
+    else:
+        first_word = ''
+
+    if first_word in _ADB_REQUIRED_CMDS and _adb_connected():
+        # Route through adb shell
+        if shell and isinstance(cmd, str):
+            return _adb_shell(cmd, timeout=timeout)
+        elif isinstance(cmd, list):
+            return _adb_shell(' '.join(cmd), timeout=timeout)
+
     try:
         result = subprocess.run(
             cmd, shell=shell, capture_output=True, text=True,
             timeout=timeout, encoding='utf-8', errors='replace',
+            env=env,
         )
         return {
             'success': result.returncode == 0,
@@ -119,6 +193,87 @@ async def get_location(provider: str = "gps", request: str = "once") -> str:
     return _format_json(_termux('termux-location', ['-p', provider, '-r', request], timeout=60))
 
 # ---------------------------------------------------------------------------
+# ADB Setup (required on Android 12+ for system commands)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def adb_setup_status() -> str:
+    """Check if ADB is set up and connected. On Android 12+, ADB is required
+    for screencap, input, uiautomator, am, etc. to work from Termux.
+
+    If not connected, follow the instructions in the output to set up.
+    """
+    # Check if adb is installed
+    r = _run(['which', 'adb'], timeout=5)
+    if not r['success']:
+        return ("ADB not installed.\n"
+                "Run: pkg install android-tools\n"
+                "Then use adb_connect tool to connect.")
+
+    connected = _adb_connected()
+    if connected:
+        devices = _run(['adb', 'devices'], timeout=5)
+        return f"ADB is connected!\n{devices.get('stdout', '')}"
+
+    return ("ADB is installed but not connected.\n\n"
+            "To connect (do this on the phone):\n"
+            "1. Go to Settings → Developer Options → Wireless Debugging → ON\n"
+            "2. Tap 'Pair device with pairing code'\n"
+            "3. Note the pairing code and port\n"
+            "4. Use the adb_connect tool with the pairing info")
+
+
+@mcp.tool()
+async def adb_connect(pair_code: str = "", pair_port: str = "", connect_port: str = "") -> str:
+    """Connect ADB to this device wirelessly. Required on Android 12+.
+
+    Step 1: If pair_code and pair_port are given, pair first.
+    Step 2: If connect_port is given (or after pairing), connect.
+
+    Find these in: Settings → Developer Options → Wireless Debugging
+
+    Args:
+        pair_code: Pairing code from wireless debugging (for first-time pairing)
+        pair_port: Pairing port from wireless debugging (e.g. '37123')
+        connect_port: Connection port shown on wireless debugging main page (e.g. '5555' or '45678')
+    """
+    results = []
+
+    # Step 1: Pair if needed
+    if pair_code and pair_port:
+        # adb pair needs the code via stdin
+        try:
+            proc = subprocess.Popen(
+                ['adb', 'pair', f'localhost:{pair_port}'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=_ensure_path_env(),
+            )
+            stdout, stderr = proc.communicate(input=f'{pair_code}\n', timeout=15)
+            results.append(f"Pair: {stdout.strip()} {stderr.strip()}")
+        except Exception as e:
+            results.append(f"Pair error: {e}")
+
+    # Step 2: Connect
+    if connect_port:
+        r = _run(f'adb connect localhost:{connect_port}', shell=True, timeout=10)
+        results.append(f"Connect: {r.get('stdout', '')} {r.get('stderr', '')}")
+    elif not pair_code:
+        # Try common port
+        r = _run('adb connect localhost:5555', shell=True, timeout=10)
+        results.append(f"Connect: {r.get('stdout', '')} {r.get('stderr', '')}")
+
+    # Verify
+    connected = _adb_connected()
+    results.append(f"\nADB connected: {'Yes ✓' if connected else 'No ✗'}")
+
+    if not connected:
+        results.append("\nTip: Make sure 'Wireless debugging' is ON in Developer Options.")
+        results.append("Then provide the correct connect_port from the wireless debugging page.")
+
+    return "\n".join(results)
+
+
+# ---------------------------------------------------------------------------
 # App Management
 # ---------------------------------------------------------------------------
 
@@ -198,12 +353,29 @@ async def take_screenshot(output_path: str = "/data/data/com.termux/files/home/s
     Args:
         output_path: Where to save the screenshot file
     """
-    r = _run(f'screencap -p {output_path}', shell=True, timeout=10)
-    if not r['success']:
+    # adb shell screencap can't write to Termux's private dir, use /sdcard/ as intermediary
+    tmp_path = '/sdcard/mcp_screenshot.png'
+    if _adb_connected():
+        r = _adb_shell(f'screencap -p {tmp_path}', timeout=10)
+        if r['success']:
+            # Copy from /sdcard/ to our output path
+            import shutil
+            sdcard_real = '/storage/emulated/0/mcp_screenshot.png'
+            try:
+                shutil.copy2(sdcard_real, output_path)
+            except Exception:
+                # Try adb pull as fallback
+                _run(f'adb pull {tmp_path} {output_path}', shell=True, timeout=10)
+    else:
+        r = _run(f'screencap -p {output_path}', shell=True, timeout=10)
+
+    if not r.get('success'):
         return f"Error taking screenshot: {r.get('error', r.get('stderr', 'Unknown'))}"
+
     path = Path(output_path)
-    if not path.exists():
-        return "Error: Screenshot file was not created"
+    if not path.exists() or path.stat().st_size == 0:
+        return "Error: Screenshot file was not created or is empty"
+
     # Return base64 so Claude can see the screen
     try:
         with open(path, 'rb') as f:
@@ -342,8 +514,22 @@ async def dump_ui(output_path: str = "/data/data/com.termux/files/home/ui_dump.x
     Args:
         output_path: Where to save the XML dump
     """
-    r = _run(f'uiautomator dump {output_path}', shell=True, timeout=15)
-    if not r['success']:
+    # uiautomator needs to dump to a path it can write to
+    tmp_dump = '/sdcard/mcp_ui_dump.xml'
+    sdcard_real = '/storage/emulated/0/mcp_ui_dump.xml'
+
+    if _adb_connected():
+        r = _adb_shell(f'uiautomator dump {tmp_dump}', timeout=15)
+        if r['success']:
+            import shutil
+            try:
+                shutil.copy2(sdcard_real, output_path)
+            except Exception:
+                _run(f'adb pull {tmp_dump} {output_path}', shell=True, timeout=10)
+    else:
+        r = _run(f'uiautomator dump {output_path}', shell=True, timeout=15)
+
+    if not r.get('success'):
         return f"Error dumping UI: {r.get('error', r.get('stderr', 'Unknown'))}"
 
     path = Path(output_path)
@@ -414,9 +600,22 @@ async def find_and_tap(text: str) -> str:
     """
     import re
 
-    dump_path = "/data/data/com.termux/files/home/ui_dump_tap.xml"
-    r = _run(f'uiautomator dump {dump_path}', shell=True, timeout=15)
-    if not r['success']:
+    dump_path = f"{HOME}/ui_dump_tap.xml"
+    tmp_dump = '/sdcard/mcp_ui_dump_tap.xml'
+    sdcard_real = '/storage/emulated/0/mcp_ui_dump_tap.xml'
+
+    if _adb_connected():
+        r = _adb_shell(f'uiautomator dump {tmp_dump}', timeout=15)
+        if r.get('success'):
+            import shutil
+            try:
+                shutil.copy2(sdcard_real, dump_path)
+            except Exception:
+                _run(f'adb pull {tmp_dump} {dump_path}', shell=True, timeout=10)
+    else:
+        r = _run(f'uiautomator dump {dump_path}', shell=True, timeout=15)
+
+    if not r.get('success'):
         return f"Error dumping UI: {r.get('error', r.get('stderr', 'Unknown'))}"
 
     path = Path(dump_path)
@@ -848,6 +1047,7 @@ async def execute_command(command: str, working_directory: str = ".", timeout: i
             command, shell=True, capture_output=True, text=True,
             timeout=timeout, cwd=working_directory,
             encoding='utf-8', errors='replace',
+            env=_ensure_path_env(),
         )
         output = []
         if result.stdout.strip():

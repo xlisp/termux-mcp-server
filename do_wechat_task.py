@@ -1,17 +1,29 @@
 """
 Task: Open WeChat, find contact "0oo粉", send "晚安" message.
+
+Prerequisites:
+  1. pkg install android-tools
+  2. Enable Wireless Debugging in Developer Options
+  3. adb pair localhost:<pair_port>   (enter pairing code)
+  4. adb connect localhost:<connect_port>
+  5. Verify: adb devices  (should show "device")
+
 Run with: python do_wechat_task.py
 """
 import subprocess
 import time
 import re
 import os
-import sys
 
 os.environ.setdefault('TMPDIR', '/data/data/com.termux/files/usr/tmp')
 os.makedirs(os.environ['TMPDIR'], exist_ok=True)
 
+if '/system/bin' not in os.environ.get('PATH', ''):
+    os.environ['PATH'] = f"/system/bin:{os.environ.get('PATH', '')}"
+
 HOME = '/data/data/com.termux/files/home'
+USE_ADB = True  # Android 12+ needs adb shell
+
 
 def run(cmd, shell=True, timeout=15):
     try:
@@ -20,36 +32,75 @@ def run(cmd, shell=True, timeout=15):
         out = r.stdout.strip()
         err = r.stderr.strip()
         if out:
-            print(f"  [stdout] {out[:200]}")
+            print(f"  [stdout] {out[:300]}")
         if err:
-            print(f"  [stderr] {err[:200]}")
+            print(f"  [stderr] {err[:300]}")
         return r.returncode == 0, out, err
+    except subprocess.TimeoutExpired:
+        print(f"  [timeout] after {timeout}s")
+        return False, '', 'timeout'
     except Exception as e:
         print(f"  [error] {e}")
         return False, '', str(e)
 
+
+def adb(cmd, timeout=15):
+    """Run command via adb shell."""
+    print(f"  $ adb shell {cmd}")
+    return run(f'adb shell {cmd}', timeout=timeout)
+
+
+def check_adb():
+    """Check if adb is connected."""
+    ok, out, _ = run('adb devices', timeout=5)
+    if ok:
+        for line in out.split('\n')[1:]:
+            if '\tdevice' in line:
+                print(f"  ✓ ADB connected: {line.strip()}")
+                return True
+    print("  ✗ ADB not connected!")
+    print("  Please run:")
+    print("    1. Settings → Developer Options → Wireless Debugging → ON")
+    print("    2. Tap 'Pair device with pairing code'")
+    print("    3. adb pair localhost:<port>  (enter the code)")
+    print("    4. adb connect localhost:<port>")
+    return False
+
+
 def screenshot(name="screenshot"):
+    tmp = '/sdcard/mcp_screenshot.png'
     path = f"{HOME}/{name}.png"
-    print(f"\n📸 Taking screenshot → {path}")
-    run(f'screencap -p {path}')
-    if os.path.exists(path):
-        size = os.path.getsize(path)
-        print(f"  ✓ Screenshot saved ({size:,} bytes)")
+    print(f"\n📸 Screenshot → {name}.png")
+    if USE_ADB:
+        adb(f'screencap -p {tmp}')
+        # Copy from sdcard to home
+        run(f'cp /storage/emulated/0/mcp_screenshot.png {path}')
     else:
-        print(f"  ✗ Screenshot failed")
+        run(f'screencap -p {path}')
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        print(f"  ✓ Saved ({os.path.getsize(path):,} bytes)")
+    else:
+        print(f"  ✗ Failed")
     return path
 
+
 def dump_ui():
+    tmp = '/sdcard/mcp_ui_dump.xml'
     path = f"{HOME}/ui_dump.xml"
-    print(f"\n🔍 Dumping UI → {path}")
-    run(f'uiautomator dump {path}')
+    print(f"\n🔍 Dumping UI...")
+    if USE_ADB:
+        adb(f'uiautomator dump {tmp}')
+        run(f'cp /storage/emulated/0/mcp_ui_dump.xml {path}')
+    else:
+        run(f'uiautomator dump {path}')
+
     if not os.path.exists(path):
         print("  ✗ UI dump failed")
         return ""
+
     with open(path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    # Parse elements
     nodes = re.findall(
         r'text="([^"]*)".*?content-desc="([^"]*)".*?clickable="([^"]*)".*?'
         r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
@@ -61,12 +112,12 @@ def dump_ui():
             cx = (int(x1) + int(x2)) // 2
             cy = (int(y1) + int(y2)) // 2
             label = text or desc
-            click = " *clickable*" if clickable == "true" else ""
+            click = " *click*" if clickable == "true" else ""
             print(f"    [{label}] → ({cx},{cy}){click}")
     return content
 
+
 def find_and_tap(ui_content, search_text):
-    """Find element by text and tap it."""
     nodes = re.findall(
         r'text="([^"]*)".*?content-desc="([^"]*)".*?'
         r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
@@ -79,124 +130,142 @@ def find_and_tap(ui_content, search_text):
             cy = (int(y1) + int(y2)) // 2
             label = text or desc
             print(f"\n👆 Found \"{label}\" → tapping ({cx},{cy})")
-            run(f'input tap {cx} {cy}')
+            if USE_ADB:
+                adb(f'input tap {cx} {cy}')
+            else:
+                run(f'input tap {cx} {cy}')
             return True, cx, cy
     print(f"\n❌ Not found: \"{search_text}\"")
     return False, 0, 0
 
+
 def tap(x, y):
     print(f"\n👆 Tapping ({x},{y})")
-    run(f'input tap {x} {y}')
+    if USE_ADB:
+        adb(f'input tap {x} {y}')
+    else:
+        run(f'input tap {x} {y}')
+
 
 def input_chinese(text):
-    """Input Chinese text via clipboard paste."""
+    """Input Chinese text via ADB broadcast (most reliable method)."""
     print(f"\n⌨️ Inputting: {text}")
-    # Set clipboard
-    run(f'termux-clipboard-set "{text}"')
-    time.sleep(0.5)
-    # Paste
-    run('input keyevent 279')  # KEYCODE_PASTE
-    time.sleep(0.5)
+    if USE_ADB:
+        # Method: Use ADB to set clipboard then paste
+        # First, use am broadcast to set clipboard
+        escaped = text.replace("'", "'\\''")
+        adb(f"am broadcast -a clipper.set -e text '{escaped}'", timeout=5)
+        time.sleep(0.3)
+        # Try direct input text (works for ASCII)
+        # For Chinese, use the clipboard approach
+        run(f'termux-clipboard-set "{text}"', timeout=5)
+        time.sleep(0.3)
+        adb('input keyevent 279')  # PASTE
+    else:
+        run(f'termux-clipboard-set "{text}"', timeout=5)
+        time.sleep(0.3)
+        run('input keyevent 279')
 
-def press_key(name, code):
-    print(f"\n🔘 Pressing {name}")
-    run(f'input keyevent {code}')
+
+def press_back():
+    print("\n🔙 Back")
+    if USE_ADB:
+        adb('input keyevent 4')
+    else:
+        run('input keyevent 4')
+
 
 # ============================================================
-# Main Task: Open WeChat → Send "晚安" to "0oo粉"
-# ============================================================
-
 print("=" * 60)
 print("Task: Open WeChat, send '晚安' to '0oo粉'")
 print("=" * 60)
 
+# Pre-check: ADB
+print("\n🔧 Checking ADB connection...")
+if not check_adb():
+    exit(1)
+
 # Step 1: Open WeChat
 print("\n📱 Step 1: Opening WeChat...")
-run('am start -n com.tencent.mm/.ui.LauncherUI')
+adb('am start -n com.tencent.mm/.ui.LauncherUI')
 time.sleep(4)
 
-# Step 2: See what's on screen
-screenshot("step2_wechat_home")
+# Step 2: See screen
+screenshot("step2_home")
 ui = dump_ui()
 
-# Step 3: Try to find search/搜索 to search for the contact
+# Step 3: Look for search
 print("\n📱 Step 3: Looking for search...")
-# Try tapping the search icon (usually top right area)
-# First try to find it in UI
 found, _, _ = find_and_tap(ui, "搜索")
 if not found:
-    # Try the magnifying glass icon - often at top right
-    # WeChat search is usually accessible via the + button or search bar
+    # WeChat has a search icon at the top, try content-desc
     found, _, _ = find_and_tap(ui, "Search")
     if not found:
-        # Try tapping the top search area directly
-        # On most phones, WeChat search bar is at the top
-        print("\n  Trying to tap search area at top of screen...")
-        # Get screen width first
-        ok, out, _ = run('wm size')
-        if ok and 'x' in out:
-            match = re.search(r'(\d+)x(\d+)', out)
-            if match:
-                w, h = int(match.group(1)), int(match.group(2))
-                print(f"  Screen size: {w}x{h}")
+        # Some WeChat versions: tap the top area to reveal search
+        print("  Trying top area for search bar...")
+        # Get screen size
+        ok, out, _ = adb('wm size') if USE_ADB else run('wm size')
+        w, h = 1080, 2400  # defaults
+        if ok or out:
+            m = re.search(r'(\d+)x(\d+)', out)
+            if m:
+                w, h = int(m.group(1)), int(m.group(2))
+        # Tap magnifying glass (usually top-right area)
+        tap(w - 100, 160)
 
 time.sleep(2)
-screenshot("step3_after_search")
+screenshot("step3_search")
 ui = dump_ui()
 
-# Step 4: Try to find the contact "0oo粉"
-# If we're now on a search page, type the contact name
-print("\n📱 Step 4: Searching for contact '0oo粉'...")
+# Step 4: Input contact name
+print("\n📱 Step 4: Searching for '0oo粉'...")
 input_chinese("0oo粉")
 time.sleep(2)
 
-screenshot("step4_search_result")
+screenshot("step4_results")
 ui = dump_ui()
 
-# Step 5: Tap on the contact in search results
+# Step 5: Tap on contact
 print("\n📱 Step 5: Tapping on contact...")
 found, _, _ = find_and_tap(ui, "0oo粉")
 if not found:
     found, _, _ = find_and_tap(ui, "0oo")
     if not found:
-        # Try partial match
         found, _, _ = find_and_tap(ui, "粉")
 time.sleep(2)
 
-screenshot("step5_chat_window")
+screenshot("step5_chat")
 ui = dump_ui()
 
-# Step 6: Tap message input area and type message
-print("\n📱 Step 6: Finding input field and typing message...")
-# Look for the message input field
+# Step 6: Find input field and type message
+print("\n📱 Step 6: Typing message...")
 found, _, _ = find_and_tap(ui, "输入")
 if not found:
     found, _, _ = find_and_tap(ui, "消息")
     if not found:
-        # WeChat input box is usually at the bottom - try tapping bottom area
-        ok, out, _ = run('wm size')
-        if ok:
-            match = re.search(r'(\d+)x(\d+)', out)
-            if match:
-                w, h = int(match.group(1)), int(match.group(2))
-                tap(w // 2, h - 150)  # Bottom center area
+        # Input field is usually at bottom center
+        ok, out, _ = adb('wm size') if USE_ADB else run('wm size')
+        w, h = 1080, 2400
+        m = re.search(r'(\d+)x(\d+)', out if out else '')
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+        tap(w // 2, h - 150)
 time.sleep(1)
 
-# Type the message
 input_chinese("晚安")
 time.sleep(1)
 
-screenshot("step6_message_typed")
+screenshot("step6_typed")
 ui = dump_ui()
 
-# Step 7: Send the message
-print("\n📱 Step 7: Sending message...")
+# Step 7: Send
+print("\n📱 Step 7: Sending...")
 found, _, _ = find_and_tap(ui, "发送")
 if not found:
     found, _, _ = find_and_tap(ui, "Send")
 time.sleep(1)
 
-screenshot("step7_sent")
+screenshot("step7_done")
 print("\n" + "=" * 60)
-print("✅ Task complete! Check screenshots in ~/")
+print("✅ Done! Check ~/step*.png for screenshots")
 print("=" * 60)
