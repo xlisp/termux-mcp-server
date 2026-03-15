@@ -5,6 +5,7 @@ Provides tools for:
 - Device info (battery, WiFi, telephony)
 - Location tracking
 - App management (list running apps, launch apps)
+- UI automation (tap, swipe, type text, screenshot, UI dump)
 - Media (camera, photos, media player)
 - Communication (SMS, contacts, clipboard, notifications)
 - System control (volume, torch, vibrate, TTS)
@@ -185,6 +186,298 @@ async def list_android_packages(filter_keyword: str = "") -> str:
     else:
         r = _run(['pm', 'list', 'packages'], timeout=15)
     return r.get('stdout', r.get('error', 'Failed to list packages'))
+
+# ---------------------------------------------------------------------------
+# UI Automation (tap, swipe, type, screenshot, UI hierarchy)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def take_screenshot(output_path: str = "/data/data/com.termux/files/home/screenshot.png") -> str:
+    """Take a screenshot of the current phone screen. Returns the screenshot as base64 image data.
+
+    Args:
+        output_path: Where to save the screenshot file
+    """
+    r = _run(f'screencap -p {output_path}', shell=True, timeout=10)
+    if not r['success']:
+        return f"Error taking screenshot: {r.get('error', r.get('stderr', 'Unknown'))}"
+    path = Path(output_path)
+    if not path.exists():
+        return "Error: Screenshot file was not created"
+    # Return base64 so Claude can see the screen
+    try:
+        with open(path, 'rb') as f:
+            data = base64.b64encode(f.read()).decode('ascii')
+        return f"Screenshot saved to {output_path} ({path.stat().st_size:,} bytes)\n\ndata:image/png;base64,{data}"
+    except Exception as e:
+        return f"Screenshot saved to {output_path} but failed to encode: {e}"
+
+
+@mcp.tool()
+async def get_screen_size() -> str:
+    """Get the phone screen resolution (width x height in pixels)."""
+    r = _run('wm size', shell=True, timeout=5)
+    return r.get('stdout', r.get('error', 'Failed'))
+
+
+@mcp.tool()
+async def tap_screen(x: int, y: int) -> str:
+    """Tap the screen at specific coordinates.
+
+    Use take_screenshot + dump_ui first to find the right coordinates.
+
+    Args:
+        x: X coordinate (pixels from left)
+        y: Y coordinate (pixels from top)
+    """
+    r = _run(f'input tap {x} {y}', shell=True, timeout=5)
+    if r['success']:
+        return f"Tapped at ({x}, {y})"
+    return f"Error: {r.get('error', r.get('stderr', 'Failed'))}"
+
+
+@mcp.tool()
+async def long_press(x: int, y: int, duration_ms: int = 1000) -> str:
+    """Long press at specific screen coordinates.
+
+    Args:
+        x: X coordinate
+        y: Y coordinate
+        duration_ms: Press duration in milliseconds (default: 1000)
+    """
+    r = _run(f'input swipe {x} {y} {x} {y} {duration_ms}', shell=True, timeout=10)
+    if r['success']:
+        return f"Long pressed at ({x}, {y}) for {duration_ms}ms"
+    return f"Error: {r.get('error', r.get('stderr', 'Failed'))}"
+
+
+@mcp.tool()
+async def swipe_screen(x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> str:
+    """Swipe on the screen from one point to another.
+
+    Args:
+        x1: Start X coordinate
+        y1: Start Y coordinate
+        x2: End X coordinate
+        y2: End Y coordinate
+        duration_ms: Swipe duration in milliseconds (default: 300)
+    """
+    r = _run(f'input swipe {x1} {y1} {x2} {y2} {duration_ms}', shell=True, timeout=10)
+    if r['success']:
+        return f"Swiped from ({x1},{y1}) to ({x2},{y2}) in {duration_ms}ms"
+    return f"Error: {r.get('error', r.get('stderr', 'Failed'))}"
+
+
+@mcp.tool()
+async def input_text(text: str) -> str:
+    """Type text into the currently focused input field.
+
+    Note: This works best with ASCII text. For Chinese/Unicode text,
+    use set_clipboard + input_keyevent(keycode='279') (paste) instead.
+
+    Args:
+        text: Text to type (spaces are supported)
+    """
+    # Replace spaces with %s for 'input text'
+    escaped = text.replace(' ', '%s')
+    r = _run(f'input text "{escaped}"', shell=True, timeout=10)
+    if r['success']:
+        return f"Typed: {text}"
+    return f"Error: {r.get('error', r.get('stderr', 'Failed'))}"
+
+
+@mcp.tool()
+async def input_chinese_text(text: str) -> str:
+    """Input Chinese/Unicode text by copying to clipboard and pasting.
+
+    This is the reliable way to input non-ASCII text (Chinese, Japanese, emoji, etc.).
+
+    Args:
+        text: The text to input (any language)
+    """
+    # Step 1: Set clipboard
+    clip_result = _termux('termux-clipboard-set', [text])
+    if clip_result and 'Error' in clip_result:
+        return f"Failed to set clipboard: {clip_result}"
+    # Step 2: Paste (Ctrl+V = KEYCODE_PASTE = 279)
+    r = _run('input keyevent 279', shell=True, timeout=5)
+    if r['success']:
+        return f"Pasted text: {text}"
+    # Fallback: try Ctrl+V combo
+    r = _run('input keyevent --longpress 113 50', shell=True, timeout=5)
+    return f"Attempted paste of: {text}"
+
+
+@mcp.tool()
+async def input_keyevent(keycode: str) -> str:
+    """Send a key event to the phone.
+
+    Args:
+        keycode: Android keycode name or number. Common ones:
+            - '3' or 'KEYCODE_HOME' = Home button
+            - '4' or 'KEYCODE_BACK' = Back button
+            - '26' or 'KEYCODE_POWER' = Power button
+            - '24' = Volume Up, '25' = Volume Down
+            - '66' or 'KEYCODE_ENTER' = Enter/Confirm
+            - '67' or 'KEYCODE_DEL' = Backspace/Delete
+            - '61' or 'KEYCODE_TAB' = Tab
+            - '82' or 'KEYCODE_MENU' = Menu
+            - '187' or 'KEYCODE_APP_SWITCH' = Recent apps
+            - '279' or 'KEYCODE_PASTE' = Paste
+            - '84' or 'KEYCODE_SEARCH' = Search
+    """
+    r = _run(f'input keyevent {keycode}', shell=True, timeout=5)
+    if r['success']:
+        return f"Sent keyevent: {keycode}"
+    return f"Error: {r.get('error', r.get('stderr', 'Failed'))}"
+
+
+@mcp.tool()
+async def dump_ui(output_path: str = "/data/data/com.termux/files/home/ui_dump.xml") -> str:
+    """Dump the current UI hierarchy (XML). Shows all visible UI elements with their
+    text, content-desc, bounds (coordinates), class name, and clickable state.
+
+    Use this to find the right element/coordinates before tapping.
+
+    Args:
+        output_path: Where to save the XML dump
+    """
+    r = _run(f'uiautomator dump {output_path}', shell=True, timeout=15)
+    if not r['success']:
+        return f"Error dumping UI: {r.get('error', r.get('stderr', 'Unknown'))}"
+
+    path = Path(output_path)
+    if not path.exists():
+        return "Error: UI dump file was not created"
+
+    try:
+        content = path.read_text(encoding='utf-8')
+    except Exception as e:
+        return f"Error reading dump: {e}"
+
+    # Parse into readable summary
+    import re
+    nodes = re.findall(
+        r'<node[^>]*?'
+        r'text="([^"]*)"[^>]*?'
+        r'resource-id="([^"]*)"[^>]*?'
+        r'class="([^"]*)"[^>]*?'
+        r'content-desc="([^"]*)"[^>]*?'
+        r'clickable="([^"]*)"[^>]*?'
+        r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
+        content
+    )
+
+    if not nodes:
+        # Try alternate attribute order
+        nodes = re.findall(
+            r'text="([^"]*)".*?resource-id="([^"]*)".*?class="([^"]*)".*?'
+            r'content-desc="([^"]*)".*?clickable="([^"]*)".*?'
+            r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
+            content
+        )
+
+    lines = [f"UI Elements on screen ({len(nodes)} found):\n"]
+    for text, res_id, cls, desc, clickable, x1, y1, x2, y2 in nodes:
+        # Calculate center point for tapping
+        cx = (int(x1) + int(x2)) // 2
+        cy = (int(y1) + int(y2)) // 2
+        short_cls = cls.split('.')[-1] if '.' in cls else cls
+
+        label_parts = []
+        if text:
+            label_parts.append(f'"{text}"')
+        if desc:
+            label_parts.append(f'[{desc}]')
+        if res_id:
+            short_id = res_id.split('/')[-1] if '/' in res_id else res_id
+            label_parts.append(f'({short_id})')
+
+        label = ' '.join(label_parts) or '(no label)'
+        click_mark = ' *clickable*' if clickable == 'true' else ''
+
+        lines.append(f"  {short_cls}: {label} → tap({cx}, {cy}){click_mark}")
+
+    lines.append(f"\nFull XML saved to: {output_path}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def find_and_tap(text: str) -> str:
+    """Find a UI element by its text and tap on it.
+
+    This combines dump_ui + tap_screen: dumps the UI hierarchy, finds an element
+    matching the given text, and taps its center.
+
+    Args:
+        text: Text to search for in UI elements (partial match, case-insensitive)
+    """
+    import re
+
+    dump_path = "/data/data/com.termux/files/home/ui_dump_tap.xml"
+    r = _run(f'uiautomator dump {dump_path}', shell=True, timeout=15)
+    if not r['success']:
+        return f"Error dumping UI: {r.get('error', r.get('stderr', 'Unknown'))}"
+
+    path = Path(dump_path)
+    if not path.exists():
+        return "Error: UI dump file was not created"
+
+    try:
+        content = path.read_text(encoding='utf-8')
+    except Exception as e:
+        return f"Error reading dump: {e}"
+
+    # Find all nodes with bounds
+    pattern = r'text="([^"]*)".*?content-desc="([^"]*)".*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"'
+    matches = re.findall(pattern, content)
+
+    text_lower = text.lower()
+    for node_text, desc, x1, y1, x2, y2 in matches:
+        if text_lower in node_text.lower() or text_lower in desc.lower():
+            cx = (int(x1) + int(x2)) // 2
+            cy = (int(y1) + int(y2)) // 2
+            r = _run(f'input tap {cx} {cy}', shell=True, timeout=5)
+            found_label = node_text or desc
+            return f"Found \"{found_label}\" → tapped at ({cx}, {cy})"
+
+    return f"No UI element found matching \"{text}\". Try take_screenshot + dump_ui to see what's on screen."
+
+
+@mcp.tool()
+async def go_home() -> str:
+    """Press the Home button to go to the home screen."""
+    r = _run('input keyevent 3', shell=True, timeout=5)
+    return "Home button pressed" if r['success'] else f"Error: {r.get('stderr', 'Failed')}"
+
+
+@mcp.tool()
+async def go_back() -> str:
+    """Press the Back button."""
+    r = _run('input keyevent 4', shell=True, timeout=5)
+    return "Back button pressed" if r['success'] else f"Error: {r.get('stderr', 'Failed')}"
+
+
+@mcp.tool()
+async def open_recent_apps() -> str:
+    """Open the recent apps / app switcher."""
+    r = _run('input keyevent 187', shell=True, timeout=5)
+    return "Recent apps opened" if r['success'] else f"Error: {r.get('stderr', 'Failed')}"
+
+
+@mcp.tool()
+async def get_current_app() -> str:
+    """Get the currently focused app (package name and activity)."""
+    # Try dumpsys
+    r = _run("dumpsys activity activities | grep -E 'mResumedActivity|mCurrentFocus' | head -3",
+             shell=True, timeout=10)
+    if r['success'] and r.get('stdout'):
+        return r['stdout']
+    # Fallback
+    r = _run("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' | head -3",
+             shell=True, timeout=10)
+    return r.get('stdout', r.get('error', 'Failed to get current app'))
+
 
 # ---------------------------------------------------------------------------
 # Camera & Photos
