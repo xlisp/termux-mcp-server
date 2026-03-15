@@ -23,6 +23,22 @@ if '/system/bin' not in os.environ.get('PATH', ''):
 
 HOME = '/data/data/com.termux/files/home'
 USE_ADB = True  # Android 12+ needs adb shell
+ADB_SERIAL = None  # Will be auto-detected
+
+
+def _detect_adb_device():
+    """Find the first online adb device serial."""
+    global ADB_SERIAL
+    try:
+        r = subprocess.run('adb devices', shell=True, capture_output=True,
+                           text=True, timeout=5)
+        for line in r.stdout.strip().split('\n')[1:]:
+            if '\tdevice' in line:
+                ADB_SERIAL = line.split('\t')[0]
+                return ADB_SERIAL
+    except Exception:
+        pass
+    return None
 
 
 def run(cmd, shell=True, timeout=15):
@@ -45,19 +61,19 @@ def run(cmd, shell=True, timeout=15):
 
 
 def adb(cmd, timeout=15):
-    """Run command via adb shell."""
-    print(f"  $ adb shell {cmd}")
-    return run(f'adb shell {cmd}', timeout=timeout)
+    """Run command via adb -s <device> shell. Auto-selects online device."""
+    serial_flag = f'-s {ADB_SERIAL} ' if ADB_SERIAL else ''
+    full = f'adb {serial_flag}shell {cmd}'
+    print(f"  $ {full}")
+    return run(full, timeout=timeout)
 
 
 def check_adb():
     """Check if adb is connected."""
-    ok, out, _ = run('adb devices', timeout=5)
-    if ok:
-        for line in out.split('\n')[1:]:
-            if '\tdevice' in line:
-                print(f"  ✓ ADB connected: {line.strip()}")
-                return True
+    device = _detect_adb_device()
+    if device:
+        print(f"  ✓ ADB connected: {device}")
+        return True
     print("  ✗ ADB not connected!")
     print("  Please run:")
     print("    1. Settings → Developer Options → Wireless Debugging → ON")

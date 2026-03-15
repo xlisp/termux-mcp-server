@@ -49,27 +49,36 @@ def _ensure_path_env() -> dict:
     return env
 
 
-def _adb_connected() -> bool:
-    """Check if adb is connected to the device."""
+def _adb_get_device() -> str | None:
+    """Get the serial of the first online adb device."""
     try:
         r = subprocess.run(
             ['adb', 'devices'], capture_output=True, text=True, timeout=5,
             env=_ensure_path_env(),
         )
-        # Look for a device line like "localhost:5555	device"
         for line in r.stdout.strip().split('\n')[1:]:
             if '\tdevice' in line:
-                return True
+                return line.split('\t')[0]
     except Exception:
         pass
-    return False
+    return None
+
+
+def _adb_connected() -> bool:
+    """Check if adb is connected to the device."""
+    return _adb_get_device() is not None
 
 
 def _adb_shell(cmd: str, timeout: int = 30) -> dict:
-    """Run a command via 'adb shell'. Used on Android 12+ where direct calls fail."""
+    """Run a command via 'adb -s <device> shell'. Auto-selects the online device."""
+    device = _adb_get_device()
+    adb_cmd = ['adb']
+    if device:
+        adb_cmd += ['-s', device]
+    adb_cmd += ['shell', cmd]
     try:
         result = subprocess.run(
-            ['adb', 'shell', cmd],
+            adb_cmd,
             capture_output=True, text=True,
             timeout=timeout, encoding='utf-8', errors='replace',
             env=_ensure_path_env(),
