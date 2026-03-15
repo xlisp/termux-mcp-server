@@ -1,0 +1,16 @@
+[project]
+name = "termux-mcp-server"
+version = "0.1.0"
+description = "Termux MCP server for controlling Android phone from Claude Desktop"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+termux-mcp = "termux_mcp_server:main"
